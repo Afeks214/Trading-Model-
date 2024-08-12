@@ -1,0 +1,248 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pytz
+from typing import Dict, List, Union, Optional, Tuple
+import logging
+import asyncio
+from dataclasses import dataclass
+import json
+
+@dataclass
+class MT5Config:
+    account: int
+    server: str
+    password: str
+    path: str
+    symbols: List[str]
+    timeframes: Dict[str, int]
+
+class MT5AdvancedInterface:
+    def __init__(self, config_path: str):
+        self.config = self.load_config(config_path)
+        self.logger = self.setup_logger()
+        self.connected = False
+        self.timezone = pytz.timezone("Etc/UTC")
+        self.symbol_info = {}
+
+    def load_config(self, config_path: str) -> MT5Config:
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+        return MT5Config(**config_data)
+
+    def setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger('MT5AdvancedInterface')
+        logger.setLevel(logging.DEBUG)
+        fh = logging.FileHandler('mt5_interface.log')
+        fh.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+        return logger
+
+    async def connect(self) -> bool:
+        if not self.connected:
+            self.logger.info("Connecting to MetaTrader 5")
+            mt5.shutdown()
+            initialized = mt5.initialize(
+                login=self.config.account,
+                server=self.config.server,
+                password=self.config.password,
+                path=self.config.path
+            )
+            if not initialized:
+                self.logger.error(f"MT5 initialization failed: {mt5.last_error()}")
+                return False
+            self.connected = True
+            self.logger.info("Connected to MetaTrader 5")
+            await self.update_symbol_info()
+        return True
+
+    async def disconnect(self) -> None:
+        if self.connected:
+            mt5.shutdown()
+            self.connected = False
+            self.logger.info("Disconnected from MetaTrader 5")
+
+    async def update_symbol_info(self) -> None:
+        for symbol in self.config.symbols:
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                self.logger.warning(f"Failed to get info for symbol {symbol}")
+            else:
+                self.symbol_info[symbol] = info._asdict()
+
+    async def get_account_info(self) -> Dict:
+        if not self.connected:
+            await self.connect()
+        account_info = mt5.account_info()
+        if account_info is None:
+            self.logger.error("Failed to get account info")
+            return {}
+        return account_info._asdict()
+
+    async def get_positions(self) -> List[Dict]:
+        if not self.connected:
+            await self.connect()
+        positions = mt5.positions_get()
+        if positions is None:
+            self.logger.error(f"Failed to get positions: {mt5.last_error()}")
+            return []
+        return [pos._asdict() for pos in positions]
+
+    async def get_symbol_info(self, symbol: str) -> Dict:
+        if symbol not in self.symbol_info:
+            await self.update_symbol_info()
+        return self.symbol_info.get(symbol, {})
+
+    async def get_prices(self, symbol: str, timeframe: str, count: int = 500) -> pd.DataFrame:
+        if not self.connected:
+            await self.connect()
+        mt5_timeframe = self.config.timeframes.get(timeframe)
+        if mt5_timeframe is None:
+            self.logger.error(f"Invalid timeframe: {timeframe}")
+            return pd.DataFrame()
+        
+        rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
+        if rates is None:
+            self.logger.error(f"Failed to get price data for {symbol}: {mt5.last_error()}")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        return df
+
+    async def place_market_order(self, symbol: str, volume: float, order_type: str, 
+                                 sl: Optional[float] = None, tp: Optional[float] = None, 
+                                 deviation: int = 20, comment: str = "") -> Dict:
+        if not self.connected:
+            await self.connect()
+        
+        symbol_info = await self.get_symbol_info(symbol)
+        if not symbol_info:
+            self.logger.error(f"Symbol info not available for {symbol}")
+            return {}
+
+        order_type_map = {
+            "BUY": mt5.ORDER_TYPE_BUY,
+            "SELL": mt5.ORDER_TYPE_SELL
+        }
+        
+        price = mt5.symbol_info_tick(symbol).ask if order_type == "BUY" else mt5.symbol_info_tick(symbol).bid
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type_map[order_type],
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": deviation,
+            "magic": 234000,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.logger.error(f"Order failed: {result.comment}")
+            return {}
+        
+        return result._asdict()
+
+    async def modify_position(self, ticket: int, sl: Optional[float] = None, tp: Optional[float] = None) -> bool:
+        if not self.connected:
+            await self.connect()
+        
+        position = mt5.positions_get(ticket=ticket)
+        if not position:
+            self.logger.error(f"Position not found: {ticket}")
+            return False
+        
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "sl": sl,
+            "tp": tp,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.logger.error(f"Position modification failed: {result.comment}")
+            return False
+        
+        return True
+
+    async def close_position(self, ticket: int, volume: Optional[float] = None) -> bool:
+        if not self.connected:
+            await self.connect()
+        
+        position = mt5.positions_get(ticket=ticket)
+        if not position:
+            self.logger.error(f"Position not found: {ticket}")
+            return False
+        
+        position = position[0]
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "position": ticket,
+            "symbol": position.symbol,
+            "volume": volume if volume else position.volume,
+            "type": mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+            "price": mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask,
+            "deviation": 20,
+            "magic": 234000,
+            "comment": "Close position",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.logger.error(f"Position closing failed: {result.comment}")
+            return False
+        
+        return True
+
+    async def get_exposure(self, symbol: str) -> float:
+        positions = await self.get_positions()
+        exposure = sum(pos['volume'] if pos['type'] == 0 else -pos['volume'] for pos in positions if pos['symbol'] == symbol)
+        return exposure
+
+    async def calculate_position_value(self, symbol: str, volume: float) -> float:
+        symbol_info = await self.get_symbol_info(symbol)
+        contract_size = symbol_info.get('trade_contract_size', 1)
+        current_price = mt5.symbol_info_tick(symbol).bid  # Using bid price for simplicity
+        return volume * contract_size * current_price
+
+    async def get_prices_multi_timeframe(self, symbol: str, count: int = 500) -> Dict[str, pd.DataFrame]:
+        prices = {}
+        for timeframe in self.config.timeframes:
+            prices[timeframe] = await self.get_prices(symbol, timeframe, count)
+        return prices
+
+# Example usage
+async def main():
+    mt5_interface = MT5AdvancedInterface('mt5_config.json')
+    await mt5_interface.connect()
+    
+    # Example usage
+    account_info = await mt5_interface.get_account_info()
+    print(f"Account Info: {account_info}")
+    
+    positions = await mt5_interface.get_positions()
+    print(f"Open Positions: {positions}")
+    
+    prices = await mt5_interface.get_prices_multi_timeframe('EURUSD', 100)
+    print(f"EURUSD Price Data (5M):\n{prices['5M'].head()}")
+    print(f"EURUSD Price Data (1M):\n{prices['1M'].head()}")
+    
+    # Close all connections
+    await mt5_interface.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
